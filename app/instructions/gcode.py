@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 # The following checks are currently performed during gcode parsing:
-# 1. UTF-8 BOM removal (line_raw = line_raw.lstrip('\ufeff'))
+# 1. UTF-8 BOM removal (line_raw = line_raw.lstrip('﻿'))
 # 2. Comment stripping (line = line_raw.split(";", 1)[0])
 # 3. Case normalization (line = line.upper())
 # 4. Whitespace handling (line = line.strip())
@@ -16,16 +16,27 @@ logger = logging.getLogger(__name__)
 # 6. Parameter value validation:
 #    - Missing numeric values for parameters
 #    - Malformed numeric values (regex check)
+#    Validation is strict only for commands consumed by the simulator
+#    (G0/G1 movements, G92 position resets). Parameters of all other
+#    commands are parsed best-effort, so vendor-specific commands with
+#    non-numeric arguments (e.g. "M1002 gcode_claim_action : 29") are
+#    tolerated.
 # 7. Unit conversion (inches to mm)
 # 8. Positioning mode tracking (absolute vs relative)
 # 9. Extrusion mode tracking (absolute vs relative)
 # 10. Position reset handling (G92)
 # 11. Unsupported M-code warnings
 # 12. Movement coordinate calculation based on modes
+# 13. G2/G3 arc movements in the XY plane (G17) are tessellated into linear
+#     segments of up to `arc_segment_length` (I/J and R forms, optional
+#     helical Z). Extrusion is distributed proportionally to segment length.
+#     Malformed arcs are skipped with a warning (their extrusion reference is
+#     still consumed so subsequent absolute extrusion deltas stay correct).
+#     Arcs in other planes (G18/G19) are not supported and are skipped.
 
 
 class Gcode(Instruction):
-    def __init__(self, gcode_path=None, gcode_content=None, default_nozzle_speed=40.0, printer=None):
+    def __init__(self, gcode_path=None, gcode_content=None, default_nozzle_speed=40.0, printer=None, arc_segment_length=0.1):
         self.gcode_path = gcode_path
         self.gcode_content = gcode_content
         self._movements = list()
@@ -34,6 +45,7 @@ class Gcode(Instruction):
         self._filaments_coordinates = list()
         self._default_nozzle_speed = default_nozzle_speed
         self._printer = printer  # Needed for E to volume conversion
+        self.arc_segment_length = arc_segment_length
 
     @property
     def movements(self):
@@ -60,6 +72,7 @@ class Gcode(Instruction):
         flag_relative = 0  # G90 -> absolute printing
         e_relative = 0  # M82 -> absolute extrusion
         unit_mode = 'mm'  # default units ('mm' or 'inches')
+        arc_plane = 'XY'  # G17 default; only the XY plane is supported for arcs
 
         # Coord list = [Xabs, Yabs, Zabs, Erelative, Vprint]
         movements = list()
@@ -101,33 +114,47 @@ class Gcode(Instruction):
                     continue
 
             command = parts[0]
+            # Parameters are consumed only for movement and position-reset
+            # commands; validate strictly there and tolerate anything else
+            # (vendor-specific commands, junk tokens, ...).
+            strict_param_command = command in ("G0", "G1", "G92")
             params = {}
             for part in parts[1:]:
                 # 5. Missing numeric value
-                if len(part) == 1 and part[0] in "XYZEF":
-                    logger.warning(
-                        f"Missing numeric value for parameter '{part}' from line: {line_raw.strip()}")
-                    raise ValueError("Please correct gcode format and retry")
-                if len(part) > 1 and part[0] in "GMXYZEF":
-                    val_str = part[1:]
-                    # 6. Malformed number
-                    if not re.match(r'^[-+]?(?:\d+\.?\d*|\.\d+)$', val_str):
+                if len(part) == 1:
+                    if strict_param_command and part in "XYZEF":
+                        logger.warning(
+                            f"Missing numeric value for parameter '{part}' from line: {line_raw.strip()}")
+                        raise ValueError("Please correct gcode format and retry")
+                    continue
+                # I, J, K, R parameters are consumed by arc movements (G2/G3)
+                if part[0] not in "GMXYZEFIJKR":
+                    # Silently ignore parameters we don't understand
+                    continue
+
+                param_letter = part[0]
+                val_str = part[1:]
+                # 6. Malformed number
+                if not re.match(r'^[-+]?(?:\d+\.?\d*|\.\d+)$', val_str):
+                    if strict_param_command and param_letter in "XYZEF":
                         logger.warning(
                             f"Malformed numeric value '{val_str}' in param '{part}' from line: {line_raw.strip()}")
                         raise ValueError(
                             "Please correct gcode format and retry")
-                    try:
-                        params[part[0]] = float(val_str)
-                    except ValueError:
+                    continue
+                try:
+                    params[param_letter] = float(val_str)
+                except ValueError:
+                    if strict_param_command and param_letter in "XYZEF":
                         logger.warning(
                             f"Could not parse parameter value in '{part}' from line: {line_raw.strip()}")
                         raise ValueError(
                             "Please correct gcode format and retry")
-                # Silently ignore other parts/parameters we don't understand
+                    continue
 
             # Convert coordinates from inches to mm if needed
             if unit_mode == 'inches':
-                for axis in ("X", "Y", "Z"):
+                for axis in ("X", "Y", "Z", "I", "J", "K", "R"):
                     if axis in params:
                         params[axis] *= 25.4
 
@@ -145,6 +172,14 @@ class Gcode(Instruction):
                 unit_mode = 'inches'
             elif command == "G21":
                 unit_mode = 'mm'
+            # Arc plane selection
+            elif command == "G17":
+                arc_plane = 'XY'
+            elif command == "G18" or command == "G19":
+                arc_plane = 'XZ' if command == "G18" else 'YZ'
+                logger.warning(
+                    f"Arc plane '{command}' is not supported (only G17/XY); "
+                    "arc movements will be skipped")
 
             # Update extrusion modes
             if command == "M82":
@@ -187,6 +222,26 @@ class Gcode(Instruction):
                         extrusion_old,
                     )
                     movements.append(coord_new)
+
+            # Arc movements: tessellated into linear segments
+            elif command == "G2" or command == "G3":
+                if any(axis in params for axis in "XYZE"):
+                    if arc_plane != 'XY':
+                        logger.warning(
+                            f"Skipping arc movement in unsupported plane on line: {line_raw.strip()}")
+                        extrusion_old = self._consume_extrusion(
+                            params, e_relative, extrusion_old)
+                    else:
+                        arc_movements, extrusion_old = self._define_arc_movements(
+                            command,
+                            params,
+                            movements[-1],
+                            flag_relative,
+                            e_relative,
+                            vprint,
+                            extrusion_old,
+                        )
+                        movements.extend(arc_movements)
 
         # Close file if we opened one
         if self.gcode_path:
@@ -233,6 +288,137 @@ class Gcode(Instruction):
         coord_new = [xnew, ynew, znew, enew, vprint]
 
         return coord_new, extrusion_old  # Return updated absolute reference for E
+
+    def _consume_extrusion(self, params, e_relative, extrusion_old):
+        """
+        Update the absolute extrusion reference for a command whose motion is
+        skipped, so that subsequent absolute extrusion deltas stay correct.
+        """
+        if "E" in params and e_relative == 0:
+            return params["E"]
+
+        return extrusion_old
+
+    def _define_arc_movements(
+        self, command, params, coord_old, flag_relative, e_relative, vprint,
+        extrusion_old
+    ):
+        """
+        Tessellate a G2 (clockwise) / G3 (counter-clockwise) arc in the XY
+        plane into linear segments. Supports the centre-offset (I/J) form, the
+        radius (R) form, and helical arcs with a linear Z change. Extrusion
+        and Z change are distributed proportionally to segment length.
+        """
+        x0, y0, z0 = coord_old[0], coord_old[1], coord_old[2]
+
+        x1, y1, z1 = x0, y0, z0
+        if "X" in params:
+            x1 = params["X"] + flag_relative * x0
+        if "Y" in params:
+            y1 = params["Y"] + flag_relative * y0
+        if "Z" in params:
+            z1 = params["Z"] + flag_relative * z0
+
+        enew = 0.0
+        if "E" in params:
+            enow = params["E"]
+            if e_relative == 0:  # Absolute extrusion
+                enew = enow - extrusion_old
+                extrusion_old = enow
+            else:  # Relative extrusion
+                enew = enow
+
+        clockwise = command == "G2"
+
+        if "R" in params:
+            centre = self._arc_centre_from_radius(x0, y0, x1, y1, params["R"], clockwise)
+            if centre is None:
+                logger.warning(
+                    f"Skipping malformed arc (invalid R form) on movement from "
+                    f"({x0}, {y0}) to ({x1}, {y1})")
+                return [], extrusion_old
+        elif "I" in params or "J" in params:
+            centre = (x0 + params.get("I", 0.0), y0 + params.get("J", 0.0))
+        else:
+            logger.warning(
+                f"Skipping malformed arc (neither I/J nor R parameters) on "
+                f"movement towards ({x1}, {y1})")
+            return [], extrusion_old
+
+        centre_x, centre_y = centre
+        radius_start = math.hypot(x0 - centre_x, y0 - centre_y)
+        radius_end = math.hypot(x1 - centre_x, y1 - centre_y)
+
+        if radius_start <= 0.0 or radius_end <= 0.0:
+            logger.warning(
+                f"Skipping malformed arc (zero radius) on movement from "
+                f"({x0}, {y0}) to ({x1}, {y1})")
+            return [], extrusion_old
+
+        angle_start = math.atan2(y0 - centre_y, x0 - centre_x)
+        angle_end = math.atan2(y1 - centre_y, x1 - centre_x)
+
+        if x1 == x0 and y1 == y0:
+            sweep = 2.0 * math.pi  # full circle
+        elif clockwise:
+            sweep = (angle_start - angle_end) % (2.0 * math.pi)
+        else:
+            sweep = (angle_end - angle_start) % (2.0 * math.pi)
+
+        number_segments = max(
+            1,
+            int(math.ceil(sweep * 0.5 * (radius_start + radius_end)
+                          / self.arc_segment_length)),
+        )
+
+        arc_movements = []
+        for step in range(1, number_segments + 1):
+            fraction = step / number_segments
+
+            if clockwise:
+                angle = angle_start - sweep * fraction
+            else:
+                angle = angle_start + sweep * fraction
+
+            # linear interpolation of the radius covers imprecise endpoints
+            radius = radius_start + (radius_end - radius_start) * fraction
+
+            arc_movements.append([
+                centre_x + radius * math.cos(angle),
+                centre_y + radius * math.sin(angle),
+                z0 + (z1 - z0) * fraction,
+                enew / number_segments,
+                vprint,
+            ])
+
+        return arc_movements, extrusion_old
+
+    def _arc_centre_from_radius(self, x0, y0, x1, y1, radius_param, clockwise):
+        """
+        Compute the arc centre for the R form. R > 0 selects the minor arc
+        (sweep <= pi), R < 0 the major arc. Returns None for malformed input.
+        """
+        dx, dy = x1 - x0, y1 - y0
+        chord = math.hypot(dx, dy)
+
+        if chord == 0.0 or radius_param == 0.0:
+            return None
+
+        radius = abs(radius_param)
+        if chord > 2.0 * radius * (1.0 + 1e-12):
+            return None
+
+        height = math.sqrt(max(radius**2 - (chord * 0.5) ** 2, 0.0))
+        mid_x, mid_y = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+
+        # left normal of the chord direction
+        left_x, left_y = -dy / chord, dx / chord
+
+        # CW arcs keep the centre right of the travel direction for R > 0;
+        # negative R flips the side.
+        side = (-1.0 if clockwise else 1.0) * (1.0 if radius_param > 0.0 else -1.0)
+
+        return (mid_x + side * height * left_x, mid_y + side * height * left_y)
 
     """
     This function returns the minimum and maximum printing coordinates;
@@ -284,6 +470,11 @@ class Gcode(Instruction):
 
                 zlist.append(coord_old[2])
                 zlist.append(coord_now[2])
+
+        if not xlist:
+            raise ValueError(
+                "The provided gcode contains no extrusion moves to simulate"
+            )
 
         xlim = [min(xlist), max(xlist)]
         ylim = [min(ylist), max(ylist)]

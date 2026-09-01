@@ -1,6 +1,6 @@
 import pytest
 
-from app.physics.nozzle_speed import NozzleSpeed
+from app.physics.acceleration.nozzle_speed import NozzleSpeed
 
 
 class TestNozzleSpeed:

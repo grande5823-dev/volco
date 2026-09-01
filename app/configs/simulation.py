@@ -38,6 +38,9 @@ class Simulation:
         
         self.sphere_z_offset = config.get("sphere_z_offset", default_sphere_z_offset)
         
+        # Maximum length of each linear segment used to approximate G2/G3 arcs
+        self.arc_segment_length = config.get("arc_segment_length", 0.1)
+
         self.simulation_name = config["simulation_name"]
         self.results_folder = config["results_folder"]
         self.radius_increment = config["radius_increment"]

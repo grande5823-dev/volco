@@ -20,10 +20,11 @@ def run_simulation(
     gcode_path=None,
     printer_config_path=None,
     sim_config_path=None,
+    heightmap_z_min=None,
 ):
     """
     Run the Volco simulation from a Python environment (e.g., Jupyter notebook).
-    
+
     Parameters:
     -----------
     gcode : str
@@ -38,20 +39,28 @@ def run_simulation(
         Path to printer configuration file (alternative to printer_config parameter)
     sim_config_path : str
         Path to simulation configuration file (alternative to sim_config parameter)
-        
+    heightmap_z_min : float or None
+        If set, skip mesh generation and produce only a 2D top-surface
+        heightmap (z as a function of x and y), considering model voxels
+        above the candidate top surface z >= heightmap_z_min (mm, in G-code
+        Z coordinates). When running from the command line the heightmap is
+        exported to '<simulation_name>_heightmap.npz'; otherwise it is
+        available via output.heightmap / output.extract_heightmap().
+
     Returns:
     --------
     SimulationOutput
         The simulation output object containing the voxel space and mesh data
-        
+
     Notes:
     ------
     After getting the simulation output object, you can:
     1. Export to STL: output.export_mesh_to_stl()
-    2. Visualize with trimesh: scene = output.visualize_mesh()
-    3. Visualize with Plotly: fig = output.visualize_mesh(visualizer='plotly')
-    4. Access the voxel space directly: output.voxel_space
-    
+    2. Export the top-surface heightmap: output.export_heightmap(z_min=...)
+    3. Visualize with trimesh: scene = output.visualize_mesh()
+    4. Visualize with Plotly: fig = output.visualize_mesh(visualizer='plotly')
+    5. Access the voxel space directly: output.voxel_space
+
     """
     start_time = time.time()
     
@@ -63,25 +72,26 @@ def run_simulation(
     else:
         raise ValueError("Either printer_config or printer_config_path must be provided")
     
-    # Initialize G-code instruction
-    default_nozzle_speed = 50.0  # Default nozzle speed in mm/s
-    if gcode:
-        instruction = Gcode(gcode_content=gcode, default_nozzle_speed=default_nozzle_speed, printer=printer)
-    elif gcode_path:
-        instruction = Gcode(gcode_path=gcode_path, default_nozzle_speed=default_nozzle_speed, printer=printer)
-    else:
-        raise ValueError("Either gcode or gcode_path must be provided")
-    
-    instruction.read()
-    print(f"Number of printed filaments: {instruction.number_printed_filaments}")
-    
-    # Initialize simulation configuration
+    # Initialize simulation configuration first: the arc tessellation
+    # resolution is needed while parsing the G-code
     if sim_config:
         simulation = Simulation(config_dict=sim_config, printer=printer)
     elif sim_config_path:
         simulation = Simulation(config_path=sim_config_path, printer=printer)
     else:
         raise ValueError("Either sim_config or sim_config_path must be provided")
+
+    # Initialize G-code instruction
+    default_nozzle_speed = 50.0  # Default nozzle speed in mm/s
+    if gcode:
+        instruction = Gcode(gcode_content=gcode, default_nozzle_speed=default_nozzle_speed, printer=printer, arc_segment_length=simulation.arc_segment_length)
+    elif gcode_path:
+        instruction = Gcode(gcode_path=gcode_path, default_nozzle_speed=default_nozzle_speed, printer=printer, arc_segment_length=simulation.arc_segment_length)
+    else:
+        raise ValueError("Either gcode or gcode_path must be provided")
+
+    instruction.read()
+    print(f"Number of printed filaments: {instruction.number_printed_filaments}")
     
     # Initialize voxel space
     voxel_space = VoxelSpace(
@@ -95,16 +105,21 @@ def run_simulation(
     
     # Process simulation output
     output = SimulationOutput(voxel_space=voxel_space, simulation=simulation)
-    
+
     # Crop the voxel space
     output.crop_voxel_space()
 
-    output.generate_mesh()
-
-    
-    # For CLI usage, generate and export STL automatically
-    if __name__ == "__main__":
-        output.export_mesh_to_stl()
+    if heightmap_z_min is None:
+        output.generate_mesh()
+        # For CLI usage, generate and export STL automatically
+        if __name__ == "__main__":
+            output.export_mesh_to_stl()
+    else:
+        # Only the top-surface heightmap is wanted: skip mesh generation.
+        if __name__ == "__main__":
+            output.export_heightmap(z_min=heightmap_z_min)
+        else:
+            output.extract_heightmap(z_min=heightmap_z_min)
     
     print(f"\nTotal simulation time: {time.time() - start_time:.2f} seconds")
     
@@ -117,5 +132,6 @@ if __name__ == "__main__":
     run_simulation(
         gcode_path=options.gcode,
         printer_config_path=options.printer,
-        sim_config_path=options.sim
+        sim_config_path=options.sim,
+        heightmap_z_min=options.heightmap,
     )

@@ -55,10 +55,16 @@ class VoxelSpace:
     def print(self):
         number_printed_filaments = 0
         number_printed_layers = 0
+        skipped_zero_length_moves = 0
+        skipped_zero_length_volume = 0.0
+        skipped_below_bed_moves = 0
+        skipped_below_bed_volume = 0.0
 
         initial_z_coordinate = 0.0
 
-        print(self._instruction.filaments_coordinates)
+        # Filled volume is tracked incrementally across spheres and filaments
+        # instead of recounting the whole voxel space for every sphere.
+        running_filled_voxels = int(np.count_nonzero(self.space))
 
         for filament_coordinates in self._instruction.filaments_coordinates:
             (
@@ -66,23 +72,38 @@ class VoxelSpace:
                 final_coordinate,
             ) = self._find_initial_and_final_filament_coordinates(filament_coordinates)
 
+            volume = filament_coordinates[2]  # Now this is volume, not E
+
+            filament_length = GeometryMath.distance(
+                initial_coordinate, final_coordinate
+            )
+
+            if filament_length == 0.0:
+                # Stationary extrusion move (prime/unretract): there is no
+                # direction along which material could be deposited.
+                skipped_zero_length_moves += 1
+                skipped_zero_length_volume += volume
+                continue
+
+            if min(initial_coordinate[2], final_coordinate[2]) <= 0.0:
+                # Filament at or below the bed plane: the simulated bead is
+                # placed below the nozzle tip, and nothing can be deposited
+                # when the nozzle touches the bed.
+                skipped_below_bed_moves += 1
+                skipped_below_bed_volume += volume
+                continue
+
             direction_vector = GeometryMath.direction_vector(
                 initial_coordinate, final_coordinate
             )
 
             printing_speed = filament_coordinates[1][4]
 
-            volume = filament_coordinates[2]  # Now this is volume, not E
-
             number_printed_filaments += 1
 
             if final_coordinate[2] > initial_z_coordinate:
                 number_printed_layers += 1
                 initial_z_coordinate = final_coordinate[2]
-
-            filament_length = GeometryMath.distance(
-                initial_coordinate, final_coordinate
-            )
 
             number_simulation_steps, step_size = self._find_simulation_step_info(
                 filament_length
@@ -97,12 +118,29 @@ class VoxelSpace:
                 printer=self._printer,
             )
 
-            self._deposit_filament(
+            running_filled_voxels = self._deposit_filament(
                 number_simulation_steps=number_simulation_steps,
                 step_size=step_size,
                 direction_vector=direction_vector,
                 filament_initial_coordinates=initial_coordinate,
                 volumes=volumes,
+                baseline_filled_voxels=running_filled_voxels,
+            )
+
+        if skipped_zero_length_moves > 0:
+            logger.warning(
+                "Skipped %d zero-length extrusion move(s) (stationary "
+                "prime/unretract); %.6f mm^3 of material were not deposited",
+                skipped_zero_length_moves,
+                skipped_zero_length_volume,
+            )
+
+        if skipped_below_bed_moves > 0:
+            logger.warning(
+                "Skipped %d extrusion move(s) at or below the bed plane "
+                "(z <= 0); %.6f mm^3 of material were not deposited",
+                skipped_below_bed_moves,
+                skipped_below_bed_volume,
             )
 
     def _find_initial_and_final_filament_coordinates(self, filament_coordinates):
@@ -123,6 +161,9 @@ class VoxelSpace:
             round(filament_length / self._simulation.step_size)
         )
 
+        # Segments shorter than half the step size are simulated as one step
+        number_simulation_steps = max(1, number_simulation_steps)
+
         step_size = filament_length / number_simulation_steps
 
         return number_simulation_steps, step_size
@@ -134,10 +175,11 @@ class VoxelSpace:
         direction_vector,
         filament_initial_coordinates,
         volumes,
+        baseline_filled_voxels,
     ):
-        total_deposited_volume = GeometryMath.calculate_filled_volume(
-            self.space, self._simulation.voxel_size
-        )
+        total_deposited_volume = baseline_filled_voxels * self._simulation.voxel_size**3
+
+        running_filled_voxels = baseline_filled_voxels
 
         for step_n in range(0, number_simulation_steps):
 
@@ -190,4 +232,9 @@ class VoxelSpace:
                 voxel_space_target_volume=volume_target,
                 solver_tolerance=self._simulation.solver_tolerance,
                 radius_increment=self._simulation.radius_increment,
+                baseline_filled_voxels=running_filled_voxels,
             )
+
+            running_filled_voxels = sphere.filled_voxel_count
+
+        return running_filled_voxels

@@ -6,9 +6,12 @@ from app.solvers.bisection_method import BisectionMethod
 
 
 class Sphere:
+    MAX_SOLVER_ITERATIONS = 500
+
     def __init__(self, centre_coordinates, voxel_size):
         self.centre_coordinates = centre_coordinates
         self.voxel_size = voxel_size
+        self.filled_voxel_count = None
 
     def deposit_sphere(
         self,
@@ -18,38 +21,63 @@ class Sphere:
         voxel_space_target_volume,
         solver_tolerance,
         radius_increment,
+        baseline_filled_voxels=None,
     ):
+        """
+        Deposit a sphere into the voxel space, choosing its radius by bisection
+        so that the total filled volume matches voxel_space_target_volume.
+
+        Evaluation is done in place on a working copy of the bounding-box
+        region only (the region is restored after each trial radius), and the
+        filled volume is tracked incrementally from baseline_filled_voxels, so
+        neither the whole voxel space copy nor the whole-space volume count
+        scales with the size of the print. If the space had to be grown for a
+        trial radius, the growth is kept; it only adds empty boundary slabs.
+
+        baseline_filled_voxels: number of voxels already filled in voxel_space
+        before this sphere (computed from the array if not provided).
+
+        After the call, self.filled_voxel_count holds the new total number of
+        filled voxels in the returned voxel space.
+        """
+        if baseline_filled_voxels is None:
+            baseline_filled_voxels = int(np.count_nonzero(voxel_space))
+
+        self._working_space = voxel_space
+        self._baseline_filled_voxels = baseline_filled_voxels
+        self._last_radius = None
+
         initial_radius = self.estimate_initial_radius(sphere_volume)
 
-        _, voxel_space = BisectionMethod().execute(
+        BisectionMethod().execute(
             self._deposit_sphere,
             initial_point=initial_radius,
             tolerance=solver_tolerance,
             increment=radius_increment,
             fun_increase_tolerance=self._increase_solver_tolerance,
-            args=(
-                voxel_space,
-                nozzle_height,
-                voxel_space_target_volume,
-            ),
+            args=(nozzle_height, voxel_space_target_volume),
+            max_iterations=self.MAX_SOLVER_ITERATIONS,
         )
 
-        return voxel_space
+        # Re-apply the accepted radius for good: the bisection evaluations
+        # above revert their changes after measuring.
+        working_space = self.deform_voxel_space_for_big_spheres(
+            self._working_space, self._last_radius
+        )
+        lower_indexes, upper_indexes = self.find_sphere_limits(
+            self._last_radius, nozzle_height
+        )
+        region = self._region_of(working_space, lower_indexes, upper_indexes)
+        newly_filled = self._fill_region(region, self._last_radius, lower_indexes)
+
+        self._working_space = working_space
+        self.filled_voxel_count = self._baseline_filled_voxels + newly_filled
+
+        return self._working_space
 
     def fill_voxels(self, voxel_space, radius, lower_indexes, upper_indexes):
-        empty_voxels = GeometryMath.find_empty_voxels_in_space(
-            voxel_space, lower_indexes, upper_indexes
-        )
-
-        for voxel in empty_voxels:
-            voxel_coordinate = GeometryMath.find_coordinates(voxel, self.voxel_size)
-
-            distance_to_centre = GeometryMath.distance(
-                voxel_coordinate, self.centre_coordinates
-            )
-
-            if distance_to_centre <= radius + self.voxel_size * 1e-8:
-                voxel_space[tuple(voxel)] = 1
+        region = self._region_of(voxel_space, lower_indexes, upper_indexes)
+        self._fill_region(region, radius, lower_indexes)
 
         return voxel_space
 
@@ -63,8 +91,11 @@ class Sphere:
             for centre_coordinate in self.centre_coordinates
         ]
 
-        if min_indexes[2] < 0:
-            min_indexes[2] = 0
+        # Clamp to the low boundary on all axes: a negative index would make
+        # numpy slicing wrap around to the far end of the array, filling
+        # voxels at the wrong location (and, via the bisection loop, growing
+        # the voxel space without bound).
+        min_indexes = [max(min_index, 0) for min_index in min_indexes]
 
         max_indexes = [
             self._find_index(centre_coordinate + radius)
@@ -115,26 +146,82 @@ class Sphere:
 
         return voxel_space
 
-    def _deposit_sphere(self, radius, voxel_space, nozzle_height, target_volume):
-        copy_voxel_space = voxel_space.copy()
+    def _deposit_sphere(self, radius, nozzle_height, target_volume):
+        """
+        Trial evaluation for the bisection method: fills the sphere's
+        bounding-box region in place, measures the resulting total volume from
+        the incremental count, then restores the region.
+        """
+        working_space = self.deform_voxel_space_for_big_spheres(
+            self._working_space, radius
+        )
+        self._working_space = working_space
 
-        copy_voxel_space = self.deform_voxel_space_for_big_spheres(
-            copy_voxel_space, radius
+        lower_indexes, upper_indexes = self.find_sphere_limits(
+            radius, nozzle_height
         )
 
-        lower_indexes, upper_indexes = self.find_sphere_limits(radius, nozzle_height)
+        region = self._region_of(working_space, lower_indexes, upper_indexes)
+        region_backup = region.copy()
 
-        copy_voxel_space = self.fill_voxels(
-            copy_voxel_space, radius, lower_indexes, upper_indexes
-        )
+        newly_filled = self._fill_region(region, radius, lower_indexes)
 
-        current_volume = GeometryMath.calculate_filled_volume(
-            copy_voxel_space, self.voxel_size
-        )
+        current_volume = (
+            self._baseline_filled_voxels + newly_filled
+        ) * self.voxel_size**3
 
         volume_overshoot = current_volume / target_volume - 1.0
 
-        return volume_overshoot, copy_voxel_space
+        region[...] = region_backup
+
+        self._last_radius = radius
+
+        return volume_overshoot, None
+
+    def _region_of(self, voxel_space, lower_indexes, upper_indexes):
+        lower_i, lower_j, lower_k = lower_indexes
+        upper_i, upper_j, upper_k = upper_indexes
+
+        return voxel_space[
+            lower_i : upper_i + 1, lower_j : upper_j + 1, lower_k : upper_k + 1
+        ]
+
+    def _fill_region(self, region, radius, lower_indexes):
+        """
+        Set to 1 the empty voxels of `region` whose centre is within `radius`
+        of the sphere centre. Returns the number of newly filled voxels.
+        Vectorized equivalent of the previous per-voxel loop; coordinate and
+        distance formulas per voxel are unchanged.
+        """
+        if not (region == 0).any():
+            return 0
+
+        shape_i, shape_j, shape_k = region.shape
+
+        indexes_i = np.arange(lower_indexes[0], lower_indexes[0] + shape_i)
+        indexes_j = np.arange(lower_indexes[1], lower_indexes[1] + shape_j)
+        indexes_k = np.arange(lower_indexes[2], lower_indexes[2] + shape_k)
+
+        coordinates_i = self.voxel_size * (2 * (indexes_i + 1) - 1) * 0.5
+        coordinates_j = self.voxel_size * (2 * (indexes_j + 1) - 1) * 0.5
+        coordinates_k = self.voxel_size * (2 * (indexes_k + 1) - 1) * 0.5
+
+        centre_i, centre_j, centre_k = self.centre_coordinates
+
+        delta_i = coordinates_i[:, None, None] - centre_i
+        delta_j = coordinates_j[None, :, None] - centre_j
+        delta_k = coordinates_k[None, None, :] - centre_k
+
+        distance = np.sqrt(delta_i**2 + delta_j**2 + delta_k**2)
+
+        within_radius = distance <= radius + self.voxel_size * 1e-8
+
+        mask = within_radius & (region == 0)
+
+        newly_filled = int(mask.sum())
+        region[mask] = 1
+
+        return newly_filled
 
     def _increase_solver_tolerance(self, radius_a, radius_b):
         return radius_b - radius_a < self.voxel_size * 0.5

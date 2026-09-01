@@ -1,5 +1,7 @@
 import json
 
+from app.physics.acceleration.transfer_function import TransferFunction
+
 
 class Printer:
     def __init__(self, config_path=None, config_dict=None):
@@ -22,3 +24,17 @@ class Printer:
         self.extruder_acceleration = config["extruder_acceleration"]
         self.feedstock_filament_diameter = config["feedstock_filament_diameter"]
         self.nozzle_diameter = config["nozzle_diameter"]
+
+        # Optional filters modelling motion-system dynamics, e.g.
+        # {"type": "first_order", "time_constant": 0.05}.
+        # Only take effect when consider_acceleration is enabled.
+        # nozzle_motion_filter: filters the nozzle motion profile.
+        # extruder_motion_filter: decouples the extruder from the nozzle; the
+        # ideal extrusion trajectory (scaled ideal nozzle velocity) is filtered
+        # with this transfer function to obtain the actual extrusion trajectory.
+        self.nozzle_motion_filter = None
+        self.extruder_motion_filter = None
+        for key in ("nozzle_motion_filter", "extruder_motion_filter"):
+            filter_config = config.get(key)
+            if filter_config is not None:
+                setattr(self, key, TransferFunction.from_config(filter_config))

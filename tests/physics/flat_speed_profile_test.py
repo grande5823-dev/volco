@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 
-from app.physics.flat_speed_profile import FlatSpeedProfile
+from app.physics.acceleration.flat_speed_profile import FlatSpeedProfile
 
 
 class TestFlatSpeedProfile:

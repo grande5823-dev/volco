@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 
-from app.physics.trapezoidal_speed_profile import TrapezoidalSpeedProfile
+from app.physics.acceleration.trapezoidal_speed_profile import TrapezoidalSpeedProfile
 
 
 class TestTrapezoidalSpeedProfile:

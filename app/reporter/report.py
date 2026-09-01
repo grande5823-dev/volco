@@ -8,6 +8,7 @@ from app.geometry.geometry_math import GeometryMath
 from app.geometry.voxel_space import VoxelSpace
 from app.reporter.visualization import color_mesh, visualize_with_trimesh, visualize_with_plotly
 from app.reporter.mesh import generate_mesh_from_voxels, export_mesh_to_stl
+from app.reporter.heightmap import compute_heightmap, DEFAULT_MISSING_VALUE
 
 
 logger = logging.getLogger(__name__)
@@ -21,13 +22,16 @@ class SimulationOutput:
     - Cropping the voxel space
     - Generating meshes from voxel data
     - Exporting meshes to STL files
+    - Extracting and exporting 2D top-surface heightmaps
     - Visualizing the results
     """
     def __init__(self, voxel_space: VoxelSpace, simulation: Simulation):
         self.voxel_space = voxel_space
         self._simulation = simulation
         self.cropped_voxel_space = None
+        self.crop_start_indexes = None  # i/j/k index of cropped space origin
         self.mesh = None
+        self.heightmap = None
 
     def crop_voxel_space(self):
         """
@@ -63,6 +67,7 @@ class SimulationOutput:
             indexes_to_crop[1][0] : indexes_to_crop[1][1] + 1,
             indexes_to_crop[2][0] : indexes_to_crop[2][1] + 1,
         ]
+        self.crop_start_indexes = tuple(indexes[0] for indexes in indexes_to_crop)
 
     def generate_mesh(self):
         """
@@ -128,6 +133,87 @@ class SimulationOutput:
         file_path = os.path.join(result_path, stl_file_name)
         
         return export_mesh_to_stl(mesh, file_path, ascii_format=self._simulation.stl_ascii)
+
+    def extract_heightmap(self, z_min, missing_value=DEFAULT_MISSING_VALUE):
+        """
+        Extract a 2D top-surface heightmap from the (cropped) voxel space.
+
+        For every (x, y) column, the reported height is the top face of the
+        highest model voxel lying entirely at or above the candidate top
+        surface plane `z >= z_min`. Columns without such a voxel are set to
+        `missing_value` (default NaN, an unrealistic height).
+
+        Parameters:
+        -----------
+        z_min : float
+            Candidate top surface plane in model (G-code) Z coordinates [mm].
+        missing_value : float
+            Sentinel for columns without material at or above z_min.
+
+        Returns:
+        --------
+        dict
+            'heights'       : (nx, ny) array of surface heights [mm]
+            'x', 'y'        : 1D arrays with the column center coordinates in
+                              model (G-code) coordinates [mm]
+            'z_min'         : the candidate top surface used [mm]
+            'voxel_size'    : voxel edge length [mm]
+            'missing_value' : the sentinel used for empty columns
+        """
+        if self.cropped_voxel_space is None or self.crop_start_indexes is None:
+            self.crop_voxel_space()
+        if self.crop_start_indexes is None:  # pragma: no cover - defensive
+            self.crop_start_indexes = (0, 0, 0)
+
+        voxel_size = self._simulation.voxel_size
+        i_first, j_first, k_first = self.crop_start_indexes
+
+        heights = compute_heightmap(
+            self.cropped_voxel_space,
+            voxel_size,
+            z_min,
+            k_first=k_first,
+            missing_value=missing_value,
+        )
+
+        # Column centers in model (G-code) coordinates: undo the filament
+        # translation and the crop offset. Voxel column (i, j) covers
+        # ((i)*vs, (i+1)*vs] in x, so its center sits at (i + 0.5)*vs.
+        nx, ny = heights.shape
+        x = (i_first + np.arange(nx) + 0.5) * voxel_size
+        x = x - self.voxel_space.filament_translations["x"]
+        y = (j_first + np.arange(ny) + 0.5) * voxel_size
+        y = y - self.voxel_space.filament_translations["y"]
+
+        self.heightmap = {
+            "heights": heights,
+            "x": x,
+            "y": y,
+            "z_min": z_min,
+            "voxel_size": voxel_size,
+            "missing_value": missing_value,
+        }
+        return self.heightmap
+
+    def export_heightmap(self, z_min, file_path=None, missing_value=DEFAULT_MISSING_VALUE):
+        """
+        Export the top-surface heightmap to a compressed .npz file containing
+        'heights', 'x', 'y' and the extraction metadata. If file_path is not
+        provided, uses '<simulation_name>_heightmap.npz' in the results folder.
+
+        Returns the exported file path.
+        """
+        heightmap = self.extract_heightmap(z_min, missing_value=missing_value)
+
+        if file_path is None:
+            result_path = self._get_result_folder_path()
+            file_path = os.path.join(
+                result_path, self._simulation.simulation_name + "_heightmap.npz"
+            )
+
+        np.savez_compressed(file_path, **heightmap)
+        logger.info(f"[Heightmap]: heightmap exported to {file_path}")
+        return file_path
 
     def visualize_mesh(self, mesh=None, visualizer='trimesh', color_scheme='cyan_blue'):
         """
