@@ -2,7 +2,7 @@ import math
 import numpy as np
 
 from app.geometry.geometry_math import GeometryMath
-from app.solvers.bisection_method_2 import BisectionMethod
+from app.solvers.bisection_method import BisectionMethod
 
 
 class Sphere:
